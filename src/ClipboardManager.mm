@@ -148,7 +148,9 @@ static NSString *const kPasteboardDarwinNotification = @"com.apple.pasteboard.no
     // Baseline before set; and mark suppression to avoid echo
     self.lastLocalSetBaselineCount = pb.changeCount;
     self.lastSetValue = [text copy];
-    self.suppressNextCallbacks = 2; // 1 for immediate local callback, 1 for following system notify
+    // There is no immediate callback here. Suppress echoes by value below;
+    // counter tokens otherwise swallow the next copy made in another app.
+    self.suppressNextCallbacks = 0;
     TVLog("Remote setString length=%lu, baseline=%ld, suppression=%ld", (unsigned long)text.length,
           (long)self.lastLocalSetBaselineCount, (long)self.suppressNextCallbacks);
 
