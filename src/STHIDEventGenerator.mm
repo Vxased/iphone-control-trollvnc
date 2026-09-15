@@ -247,6 +247,11 @@ NS_INLINE void _DTXCalcLinearPinchStartEndPoints(CGRect bounds, CGFloat pixelsSc
     NSTimer *_keepAliveTimer;
     // Incremented to invalidate pending hold micro-drift emitters.
     NSUInteger _humanHoldDriftToken;
+    dispatch_source_t _humanHoldDriftTimer;
+    // Down timestamps so live input cannot release faster than a human hand.
+    CFAbsoluteTime _touchDownTime;
+    CFAbsoluteTime _menuDownTime;
+    CFAbsoluteTime _powerDownTime;
 }
 
 + (STHIDEventGenerator *)sharedGenerator {
@@ -654,25 +659,34 @@ static InterpolationType interpolationFromString(NSString *string) {
     return eventRef;
 }
 
-static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
-    static IOHIDEventSystemClientRef _ioSystemClient = nil;
+static IOHIDEventSystemClientRef stHIDSystemClient(void) {
+    static IOHIDEventSystemClientRef client = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         @autoreleasepool {
-            _ioSystemClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+            client = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
         }
     });
+    return client;
+}
+
+// Dispatch on the calling thread. Only call from a block that is already
+// executing on the serial HID event queue, so event ordering is preserved.
+static void _dispatchHIDEventNow(IOHIDEventRef eventRef) {
+    // 0xDEFACEDBEEFFECE5: Outdated value that doesn't work anymore
+    // 0x000000010000027F: Voice-Over Only?
+    // 0x000000010000052E: iOS 14.x works
+    // 0x8000000817319371: iOS 9+
+    // 0x8000000817319372: iOS 14.8 to 26 works
+    IOHIDEventSetSenderID(eventRef, 0x8000000817319371);
+    IOHIDEventSystemClientDispatchEvent(stHIDSystemClient(), eventRef);
+}
+
+static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
     if (eventRef) {
         IOHIDEventRef strongEvent = (IOHIDEventRef)CFRetain(eventRef);
         dispatch_async(queue, ^{
-            // 0xDEFACEDBEEFFECE5: Outdated value that doesn't work anymore
-            // 0x000000010000027F: Voice-Over Only?
-            // 0x000000010000052E: iOS 14.x works
-            // 0x8000000817319371: iOS 9+
-            // 0x8000000817319372: iOS 14.8 to 26 works
-            IOHIDEventSetSenderID(strongEvent, 0x8000000817319371);
-            IOHIDEventSystemClientDispatchEvent(_ioSystemClient, strongEvent);
-
+            _dispatchHIDEventNow(strongEvent);
             CFRelease(strongEvent);
         });
     }
@@ -699,26 +713,30 @@ static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
     // Update point locations.
     BOOL humanize = stHumanizeEnabled();
     for (NSUInteger i = 0; i < count; ++i) {
-        CGPoint p = points[i];
-        if (humanize) {
-            // Subpixel motor noise: a real finger never holds a position with
-            // zero variance.
-            p.x += stGaussianRandom(0.0, 0.22);
-            p.y += stGaussianRandom(0.0, 0.22);
-            // Contact ellipse "roll": axes breathe as the finger moves.
-            if (_activePoints[i].pathBaseMajorRadius > 0) {
-                IOHIDFloat rolled =
-                    (IOHIDFloat)stClamped(_activePoints[i].pathBaseMajorRadius + stGaussianRandom(0.0, 0.15), 3.5, 9.5);
-                _activePoints[i].pathMajorRadius = rolled;
-                _activePoints[i].pathMinorRadius = rolled * MAX(_activePoints[i].pathMinorRatio, 0.6);
-            }
-        }
-        _activePoints[i].point = p;
+        if (humanize)
+            [self _humanizeActivePoint:i target:points[i]];
+        else
+            _activePoints[i].point = points[i];
     }
 
     IOHIDEventRef eventRef = [self _createIOHIDEventType:handEventType];
     _sendHIDEvent(eventRef, _hidEventQueue);
     CFRelease(eventRef);
+}
+
+// Store a target for one active finger with subpixel motor noise (a real
+// finger never holds a position with zero variance) and contact-ellipse
+// "roll" (axes breathe as the finger moves).
+- (void)_humanizeActivePoint:(NSUInteger)index target:(CGPoint)target {
+    target.x += stGaussianRandom(0.0, 0.22);
+    target.y += stGaussianRandom(0.0, 0.22);
+    if (_activePoints[index].pathBaseMajorRadius > 0) {
+        IOHIDFloat rolled =
+            (IOHIDFloat)stClamped(_activePoints[index].pathBaseMajorRadius + stGaussianRandom(0.0, 0.15), 3.5, 9.5);
+        _activePoints[index].pathMajorRadius = rolled;
+        _activePoints[index].pathMinorRadius = rolled * MAX(_activePoints[index].pathMinorRatio, 0.6);
+    }
+    _activePoints[index].point = target;
 }
 
 // Inject a low-amplitude accelerometer sample so the motion stream is not
@@ -773,31 +791,73 @@ static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
     _sendHIDEvent(eventRef, _hidEventQueue);
     CFRelease(eventRef);
 
-    if (humanize && touchCount == 1) {
-        // Hold micro-drift: a stationary real finger still produces ~120 Hz
-        // reports with sub-pixel wander. Emit tiny drift moves on the HID
-        // queue (preserving event ordering behind the touch-down) for as long
-        // as the finger stays down.
-        _humanHoldDriftToken++;
-        NSUInteger token = _humanHoldDriftToken;
-        dispatch_async(_hidEventQueue, ^{
-            while (self->_humanHoldDriftToken == token && self->_activePointCount > 0) {
-                struct timespec driftDelay = {0, (long)(stUniformRandom(7.0, 13.0) * 1.0e6)};
-                nanosleep(&driftDelay, NULL);
-                if (self->_humanHoldDriftToken != token || self->_activePointCount == 0)
-                    break;
-                for (NSUInteger i = 0; i < self->_activePointCount; ++i) {
-                    self->_activePoints[i].point.x += stGaussianRandom(0.0, 0.16);
-                    self->_activePoints[i].point.y += stGaussianRandom(0.0, 0.16);
-                }
-                CGPoint driftPoints[HIDMaxTouchCount];
-                for (NSUInteger i = 0; i < self->_activePointCount; ++i)
-                    driftPoints[i] = self->_activePoints[i].point;
-                [self _updateTouchPoints:driftPoints count:self->_activePointCount];
-                [self _injectIMUMicroMotionWithActivity:stUniformRandom(0.05, 0.25)];
-            }
-        });
+    _touchDownTime = CFAbsoluteTimeGetCurrent();
+    if (humanize && touchCount == 1)
+        [self _startHoldDrift];
+}
+
+#pragma mark - Hold micro-drift
+
+// A stationary real finger still produces ~120 Hz reports with sub-pixel
+// wander. Emit tiny drift moves for as long as the finger stays down.
+//
+// The emitter is a one-shot timer that re-arms itself with a jittered delay.
+// Its handler runs on the serial HID queue and dispatches inline, so it never
+// blocks that queue: live operator moves interleave with drift in FIFO order,
+// and a lift enqueued after the token bump always lands after the last drift.
+// (A blocking sleep loop on the queue starved every live move until lift-up.)
+- (void)_startHoldDrift {
+    [self _stopHoldDrift];
+    _humanHoldDriftToken++;
+    NSUInteger token = _humanHoldDriftToken;
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _hidEventQueue);
+    _humanHoldDriftTimer = timer;
+    dispatch_source_set_event_handler(timer, ^{
+        [self _emitHoldDriftForToken:token timer:timer];
+    });
+    [self _armHoldDriftTimer:timer];
+    dispatch_resume(timer);
+}
+
+- (void)_armHoldDriftTimer:(dispatch_source_t)timer {
+    int64_t delayNs = (int64_t)(stUniformRandom(7.0, 13.0) * 1.0e6);
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, delayNs), DISPATCH_TIME_FOREVER, 500ull * 1000ull);
+}
+
+- (void)_stopHoldDrift {
+    if (_humanHoldDriftTimer) {
+        dispatch_source_cancel(_humanHoldDriftTimer);
+        _humanHoldDriftTimer = nil;
     }
+}
+
+// Runs on _hidEventQueue.
+- (void)_emitHoldDriftForToken:(NSUInteger)token timer:(dispatch_source_t)timer {
+    if (_humanHoldDriftToken != token || _activePointCount == 0 || dispatch_source_testcancel(timer))
+        return;
+    for (NSUInteger i = 0; i < _activePointCount; ++i) {
+        CGPoint drifted = _activePoints[i].point;
+        drifted.x += stGaussianRandom(0.0, 0.16);
+        drifted.y += stGaussianRandom(0.0, 0.16);
+        [self _humanizeActivePoint:i target:drifted];
+    }
+    IOHIDEventRef eventRef = [self _createIOHIDEventType:HandEventMoved];
+    _dispatchHIDEventNow(eventRef);
+    CFRelease(eventRef);
+    [self _injectIMUMicroMotionWithActivity:stUniformRandom(0.05, 0.25)];
+    [self _armHoldDriftTimer:timer];
+}
+
+// Live input can release faster than any hand (a browser click arrives as a
+// single down/up packet pair). Hold the caller until a plausible dwell has
+// elapsed; the finger stays legitimately down and drifting meanwhile.
+- (void)_padHumanDwellSince:(CFAbsoluteTime)downTime {
+    if (!stHumanizeEnabled() || downTime <= 0)
+        return;
+    NSTimeInterval elapsed = CFAbsoluteTimeGetCurrent() - downTime;
+    NSTimeInterval dwell = stHumanKeyDwell();
+    if (elapsed < dwell)
+        STAccurateSleep(dwell - elapsed);
 }
 
 - (void)_touchDown:(CGPoint)location touchCount:(NSUInteger)touchCount {
@@ -836,9 +896,13 @@ static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
 
     NSUInteger newPointCount = _activePointCount - touchCount;
 
+    [self _padHumanDwellSince:_touchDownTime];
+    _touchDownTime = 0;
+
     // Invalidate hold micro-drift before the lift event is enqueued so no
     // stray move event can be delivered after the lift.
     _humanHoldDriftToken++;
+    [self _stopHoldDrift];
 
     BOOL humanize = stHumanizeEnabled();
     for (NSUInteger index = 0; index < touchCount; ++index) {
@@ -1690,7 +1754,8 @@ static inline uint32_t hidUsageCodeForCharacter(NSString *key) {
 }
 
 - (void)menuPress {
-    struct timespec pressDelay = {0, (long)(fingerLiftDelay * nanosecondsPerSecond)};
+    NSTimeInterval pressSec = stHumanizeEnabled() ? stHumanKeyDwell() : fingerLiftDelay;
+    struct timespec pressDelay = {0, (long)(pressSec * nanosecondsPerSecond)};
 
     [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Menu isKeyDown:true];
     nanosleep(&pressDelay, 0);
@@ -1727,17 +1792,21 @@ static inline uint32_t hidUsageCodeForCharacter(NSString *key) {
 }
 
 - (void)menuDown {
+    _menuDownTime = CFAbsoluteTimeGetCurrent();
     [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Menu isKeyDown:true];
     [self sendMarkerHIDEvent];
 }
 
 - (void)menuUp {
+    [self _padHumanDwellSince:_menuDownTime];
+    _menuDownTime = 0;
     [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Menu isKeyDown:false];
     [self sendMarkerHIDEvent];
 }
 
 - (void)powerPress {
-    struct timespec pressDelay = {0, (long)(fingerLiftDelay * nanosecondsPerSecond)};
+    NSTimeInterval pressSec = stHumanizeEnabled() ? stHumanKeyDwell() : fingerLiftDelay;
+    struct timespec pressDelay = {0, (long)(pressSec * nanosecondsPerSecond)};
 
     [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Power isKeyDown:true];
     nanosleep(&pressDelay, 0);
@@ -1797,11 +1866,14 @@ static inline uint32_t hidUsageCodeForCharacter(NSString *key) {
 }
 
 - (void)powerDown {
+    _powerDownTime = CFAbsoluteTimeGetCurrent();
     [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Power isKeyDown:true];
     [self sendMarkerHIDEvent];
 }
 
 - (void)powerUp {
+    [self _padHumanDwellSince:_powerDownTime];
+    _powerDownTime = 0;
     [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Power isKeyDown:false];
     [self sendMarkerHIDEvent];
 }
