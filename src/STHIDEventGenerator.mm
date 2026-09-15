@@ -37,6 +37,106 @@ static const IOHIDFloat defaultMajorRadius = 5;
 static const IOHIDFloat defaultPathPressure = 0;
 static const long nanosecondsPerSecond = 1e9;
 
+#pragma mark - Human Input Model
+
+// Behavioral humanization: makes synthesized touch streams statistically
+// indistinguishable from a human finger (minimum-jerk kinematics, Gaussian
+// motor noise, natural contact-geometry distributions, hold micro-drift).
+// Set TROLLVNC_HUMANIZE=0 in the environment to fall back to legacy
+// deterministic behavior.
+static BOOL stHumanizeEnabled(void) {
+    static BOOL enabled = NO;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        const char *flag = getenv("TROLLVNC_HUMANIZE");
+        enabled = (flag == NULL) || (strcmp(flag, "0") != 0);
+    });
+    return enabled;
+}
+
+NS_INLINE double stUniformRandom(double lo, double hi) {
+    return lo + (hi - lo) * ((double)arc4random_uniform(0x1000000u) / 16777216.0);
+}
+
+// Box-Muller gaussian.
+NS_INLINE double stGaussianRandom(double mean, double sigma) {
+    double u1 = ((double)arc4random_uniform(0xFFFFFFFEu) + 1.0) / 4294967296.0;
+    double u2 = stUniformRandom(0.0, 1.0);
+    return mean + sigma * sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+}
+
+NS_INLINE double stClamped(double v, double lo, double hi) { return MIN(MAX(v, lo), hi); }
+
+// Minimum-jerk (bell-shaped velocity) easing -- the standard model of human
+// reaching movements. Linear ramps have constant velocity and are trivially
+// separable from biological motion.
+NS_INLINE double stMinimumJerk(double t) {
+    t = stClamped(t, 0.0, 1.0);
+    return t * t * t * (10.0 + t * (-15.0 + 6.0 * t));
+}
+
+// Human key-press dwell: log-normal, median ~95 ms.
+NS_INLINE NSTimeInterval stHumanKeyDwell(void) {
+    return stClamped(exp(stGaussianRandom(log(0.095), 0.32)), 0.045, 0.28);
+}
+
+// Finger contact geometry. A real contact is an ellipse whose axes drift as
+// the finger rolls; synthesized events must never be geometric constants.
+NS_INLINE IOHIDFloat stHumanMajorRadius(void) {
+    return (IOHIDFloat)stClamped(stGaussianRandom(5.6, 0.75), 4.0, 8.6);
+}
+NS_INLINE IOHIDFloat stHumanMinorRatio(void) { return (IOHIDFloat)stUniformRandom(0.70, 0.93); }
+
+// Landing offset: humans do not hit the exact pixel center of a target.
+NS_INLINE CGPoint stHumanLandingOffset(void) {
+    return CGPointMake(stGaussianRandom(0.0, 1.3), stGaussianRandom(0.0, 1.3));
+}
+
+// Per-sample subpixel motor noise (below UIKit hit slop, above zero entropy).
+static const double stMoveNoiseSigma = 0.32;
+
+// Experimental sensor-stream correlation. A mounted rig reports a dead-flat
+// accelerometer while a human hand shows micro-tremor during touch activity.
+// Opt-in: TROLLVNC_IMU_SYNC=1. The rig's gravity baseline can be overridden
+// with TROLLVNC_IMU_BASELINE="x,y,z" (in G) and the tremor amplitude with
+// TROLLVNC_IMU_AMP (in G, default 0.0015).
+static BOOL stIMUSyncEnabled(void) {
+    static BOOL enabled = NO;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        const char *flag = getenv("TROLLVNC_IMU_SYNC");
+        enabled = (flag != NULL) && (strcmp(flag, "1") == 0);
+    });
+    return enabled;
+}
+
+static void stIMUBaseline(double *x, double *y, double *z) {
+    static double bx = 0.0, by = 0.0, bz = -1.0;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        const char *env = getenv("TROLLVNC_IMU_BASELINE");
+        if (env && sscanf(env, "%lf,%lf,%lf", &bx, &by, &bz) != 3) {
+            bx = 0.0;
+            by = 0.0;
+            bz = -1.0;
+        }
+    });
+    *x = bx;
+    *y = by;
+    *z = bz;
+}
+
+static double stIMUAmplitude(void) {
+    static double amp = 0.0015;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        const char *env = getenv("TROLLVNC_IMU_AMP");
+        if (env)
+            amp = atof(env);
+    });
+    return amp;
+}
+
 static int fingerIdentifiers[] = {
     2, 3, 4, 5, 1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
 };
@@ -62,6 +162,9 @@ typedef struct {
     int identifier;
     CGPoint point;
     IOHIDFloat pathMajorRadius;
+    IOHIDFloat pathMinorRadius;
+    IOHIDFloat pathBaseMajorRadius;
+    IOHIDFloat pathMinorRatio;
     IOHIDFloat pathPressure;
     UInt8 pathProximity;
     BOOL isStylus;
@@ -142,6 +245,13 @@ NS_INLINE void _DTXCalcLinearPinchStartEndPoints(CGRect bounds, CGFloat pixelsSc
     dispatch_queue_t _hidEventQueue;
     NSTimeInterval _keepAliveInterval;
     NSTimer *_keepAliveTimer;
+    // Incremented to invalidate pending hold micro-drift emitters.
+    NSUInteger _humanHoldDriftToken;
+    dispatch_source_t _humanHoldDriftTimer;
+    // Down timestamps so live input cannot release faster than a human hand.
+    CFAbsoluteTime _touchDownTime;
+    CFAbsoluteTime _menuDownTime;
+    CFAbsoluteTime _powerDownTime;
 }
 
 + (STHIDEventGenerator *)sharedGenerator {
@@ -478,12 +588,21 @@ static InterpolationType interpolationFromString(NSString *string) {
         if (eventType == HandEventTouched) {
             if (!pointInfo->pathMajorRadius)
                 pointInfo->pathMajorRadius = defaultMajorRadius;
+            if (!pointInfo->pathBaseMajorRadius)
+                pointInfo->pathBaseMajorRadius = pointInfo->pathMajorRadius;
+            if (!pointInfo->pathMinorRatio)
+                pointInfo->pathMinorRatio = stHumanizeEnabled() ? stHumanMinorRatio() : 1.0;
+            if (!pointInfo->pathMinorRadius)
+                pointInfo->pathMinorRadius = pointInfo->pathMajorRadius * pointInfo->pathMinorRatio;
             if (!pointInfo->pathPressure)
                 pointInfo->pathPressure = defaultPathPressure;
             if (!pointInfo->pathProximity)
                 pointInfo->pathProximity = kGSEventPathInfoInTouch | kGSEventPathInfoInRange;
         } else if (eventType == HandEventLifted || eventType == HandEventCanceled || eventType == StylusEventLifted) {
             pointInfo->pathMajorRadius = 0;
+            pointInfo->pathMinorRadius = 0;
+            pointInfo->pathBaseMajorRadius = 0;
+            pointInfo->pathMinorRatio = 0;
             pointInfo->pathPressure = 0;
             pointInfo->pathProximity = 0;
         }
@@ -528,7 +647,8 @@ static InterpolationType interpolationFromString(NSString *string) {
         }
 
         IOHIDEventSetFloatValue(subEvent, kIOHIDEventFieldDigitizerMinorRadius,
-                                pointInfo->pathMajorRadius); // minor radius
+                                pointInfo->pathMinorRadius > 0 ? pointInfo->pathMinorRadius
+                                                               : pointInfo->pathMajorRadius); // minor radius
         IOHIDEventSetFloatValue(subEvent, kIOHIDEventFieldDigitizerMajorRadius,
                                 pointInfo->pathMajorRadius); // major radius
 
@@ -539,25 +659,34 @@ static InterpolationType interpolationFromString(NSString *string) {
     return eventRef;
 }
 
-static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
-    static IOHIDEventSystemClientRef _ioSystemClient = nil;
+static IOHIDEventSystemClientRef stHIDSystemClient(void) {
+    static IOHIDEventSystemClientRef client = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         @autoreleasepool {
-            _ioSystemClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+            client = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
         }
     });
+    return client;
+}
+
+// Dispatch on the calling thread. Only call from a block that is already
+// executing on the serial HID event queue, so event ordering is preserved.
+static void _dispatchHIDEventNow(IOHIDEventRef eventRef) {
+    // 0xDEFACEDBEEFFECE5: Outdated value that doesn't work anymore
+    // 0x000000010000027F: Voice-Over Only?
+    // 0x000000010000052E: iOS 14.x works
+    // 0x8000000817319371: iOS 9+
+    // 0x8000000817319372: iOS 14.8 to 26 works
+    IOHIDEventSetSenderID(eventRef, 0x8000000817319371);
+    IOHIDEventSystemClientDispatchEvent(stHIDSystemClient(), eventRef);
+}
+
+static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
     if (eventRef) {
         IOHIDEventRef strongEvent = (IOHIDEventRef)CFRetain(eventRef);
         dispatch_async(queue, ^{
-            // 0xDEFACEDBEEFFECE5: Outdated value that doesn't work anymore
-            // 0x000000010000027F: Voice-Over Only?
-            // 0x000000010000052E: iOS 14.x works
-            // 0x8000000817319371: iOS 9+
-            // 0x8000000817319372: iOS 14.8 to 26 works
-            IOHIDEventSetSenderID(strongEvent, 0x8000000817319371);
-            IOHIDEventSystemClientDispatchEvent(_ioSystemClient, strongEvent);
-
+            _dispatchHIDEventNow(strongEvent);
             CFRelease(strongEvent);
         });
     }
@@ -582,13 +711,55 @@ static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
     _activePointCount = count;
 
     // Update point locations.
+    BOOL humanize = stHumanizeEnabled();
     for (NSUInteger i = 0; i < count; ++i) {
-        _activePoints[i].point = points[i];
+        if (humanize)
+            [self _humanizeActivePoint:i target:points[i]];
+        else
+            _activePoints[i].point = points[i];
     }
 
     IOHIDEventRef eventRef = [self _createIOHIDEventType:handEventType];
     _sendHIDEvent(eventRef, _hidEventQueue);
     CFRelease(eventRef);
+}
+
+// Store a target for one active finger with subpixel motor noise (a real
+// finger never holds a position with zero variance) and contact-ellipse
+// "roll" (axes breathe as the finger moves).
+- (void)_humanizeActivePoint:(NSUInteger)index target:(CGPoint)target {
+    target.x += stGaussianRandom(0.0, 0.22);
+    target.y += stGaussianRandom(0.0, 0.22);
+    if (_activePoints[index].pathBaseMajorRadius > 0) {
+        IOHIDFloat rolled =
+            (IOHIDFloat)stClamped(_activePoints[index].pathBaseMajorRadius + stGaussianRandom(0.0, 0.15), 3.5, 9.5);
+        _activePoints[index].pathMajorRadius = rolled;
+        _activePoints[index].pathMinorRadius = rolled * MAX(_activePoints[index].pathMinorRatio, 0.6);
+    }
+    _activePoints[index].point = target;
+}
+
+// Inject a low-amplitude accelerometer sample so the motion stream is not
+// dead-flat while the device is being "touched". No-op unless enabled via
+// TROLLVNC_IMU_SYNC=1.
+- (void)_injectIMUMicroMotionWithActivity:(double)activity {
+    if (!stIMUSyncEnabled())
+        return;
+
+    double bx, by, bz;
+    stIMUBaseline(&bx, &by, &bz);
+    double amp = stIMUAmplitude() * (1.0 + MIN(MAX(activity, 0.0), 3.0));
+
+    IOHIDEventRef eventRef = IOHIDEventCreateAccelerometerEvent(kCFAllocatorDefault, mach_absolute_time(),
+                                                                (IOHIDFloat)(bx + stGaussianRandom(0.0, amp)),
+                                                                (IOHIDFloat)(by + stGaussianRandom(0.0, amp)),
+                                                                (IOHIDFloat)(bz + stGaussianRandom(0.0, amp * 0.5)),
+                                                                kIOHIDEventOptionNone);
+    if (eventRef) {
+        IOHIDEventSetIntegerValue(eventRef, kIOHIDEventFieldIsBuiltIn, 1);
+        _sendHIDEvent(eventRef, _hidEventQueue);
+        CFRelease(eventRef);
+    }
 }
 
 - (void)touchDownAtPoints:(CGPoint *)locations touchCount:(NSUInteger)touchCount {
@@ -598,14 +769,95 @@ static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
 
     _activePointCount = touchCount;
 
+    BOOL humanize = stHumanizeEnabled();
     for (NSUInteger index = 0; index < touchCount; ++index) {
-        _activePoints[index].point = locations[index];
+        CGPoint p = locations[index];
+        if (humanize) {
+            // Sample a natural contact ellipse per touch, never a constant.
+            CGPoint off = stHumanLandingOffset();
+            p.x += off.x;
+            p.y += off.y;
+            IOHIDFloat base = stHumanMajorRadius();
+            _activePoints[index].pathBaseMajorRadius = base;
+            _activePoints[index].pathMajorRadius = base;
+            _activePoints[index].pathMinorRatio = stHumanMinorRatio();
+            _activePoints[index].pathMinorRadius = base * _activePoints[index].pathMinorRatio;
+        }
+        _activePoints[index].point = p;
         _activePoints[index].isStylus = NO;
     }
 
     IOHIDEventRef eventRef = [self _createIOHIDEventType:HandEventTouched];
     _sendHIDEvent(eventRef, _hidEventQueue);
     CFRelease(eventRef);
+
+    _touchDownTime = CFAbsoluteTimeGetCurrent();
+    if (humanize && touchCount == 1)
+        [self _startHoldDrift];
+}
+
+#pragma mark - Hold micro-drift
+
+// A stationary real finger still produces ~120 Hz reports with sub-pixel
+// wander. Emit tiny drift moves for as long as the finger stays down.
+//
+// The emitter is a one-shot timer that re-arms itself with a jittered delay.
+// Its handler runs on the serial HID queue and dispatches inline, so it never
+// blocks that queue: live operator moves interleave with drift in FIFO order,
+// and a lift enqueued after the token bump always lands after the last drift.
+// (A blocking sleep loop on the queue starved every live move until lift-up.)
+- (void)_startHoldDrift {
+    [self _stopHoldDrift];
+    _humanHoldDriftToken++;
+    NSUInteger token = _humanHoldDriftToken;
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _hidEventQueue);
+    _humanHoldDriftTimer = timer;
+    dispatch_source_set_event_handler(timer, ^{
+        [self _emitHoldDriftForToken:token timer:timer];
+    });
+    [self _armHoldDriftTimer:timer];
+    dispatch_resume(timer);
+}
+
+- (void)_armHoldDriftTimer:(dispatch_source_t)timer {
+    int64_t delayNs = (int64_t)(stUniformRandom(7.0, 13.0) * 1.0e6);
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, delayNs), DISPATCH_TIME_FOREVER, 500ull * 1000ull);
+}
+
+- (void)_stopHoldDrift {
+    if (_humanHoldDriftTimer) {
+        dispatch_source_cancel(_humanHoldDriftTimer);
+        _humanHoldDriftTimer = nil;
+    }
+}
+
+// Runs on _hidEventQueue.
+- (void)_emitHoldDriftForToken:(NSUInteger)token timer:(dispatch_source_t)timer {
+    if (_humanHoldDriftToken != token || _activePointCount == 0 || dispatch_source_testcancel(timer))
+        return;
+    for (NSUInteger i = 0; i < _activePointCount; ++i) {
+        CGPoint drifted = _activePoints[i].point;
+        drifted.x += stGaussianRandom(0.0, 0.16);
+        drifted.y += stGaussianRandom(0.0, 0.16);
+        [self _humanizeActivePoint:i target:drifted];
+    }
+    IOHIDEventRef eventRef = [self _createIOHIDEventType:HandEventMoved];
+    _dispatchHIDEventNow(eventRef);
+    CFRelease(eventRef);
+    [self _injectIMUMicroMotionWithActivity:stUniformRandom(0.05, 0.25)];
+    [self _armHoldDriftTimer:timer];
+}
+
+// Live input can release faster than any hand (a browser click arrives as a
+// single down/up packet pair). Hold the caller until a plausible dwell has
+// elapsed; the finger stays legitimately down and drifting meanwhile.
+- (void)_padHumanDwellSince:(CFAbsoluteTime)downTime {
+    if (!stHumanizeEnabled() || downTime <= 0)
+        return;
+    NSTimeInterval elapsed = CFAbsoluteTimeGetCurrent() - downTime;
+    NSTimeInterval dwell = stHumanKeyDwell();
+    if (elapsed < dwell)
+        STAccurateSleep(dwell - elapsed);
 }
 
 - (void)_touchDown:(CGPoint)location touchCount:(NSUInteger)touchCount {
@@ -644,8 +896,29 @@ static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
 
     NSUInteger newPointCount = _activePointCount - touchCount;
 
+    [self _padHumanDwellSince:_touchDownTime];
+    _touchDownTime = 0;
+
+    // Invalidate hold micro-drift before the lift event is enqueued so no
+    // stray move event can be delivered after the lift.
+    _humanHoldDriftToken++;
+    [self _stopHoldDrift];
+
+    BOOL humanize = stHumanizeEnabled();
     for (NSUInteger index = 0; index < touchCount; ++index) {
-        _activePoints[newPointCount + index].point = locations[index];
+        CGPoint p = locations[index];
+        if (humanize) {
+            p.x += stGaussianRandom(0.0, 0.9);
+            p.y += stGaussianRandom(0.0, 0.9);
+            // Contact shrinks as the finger peels off the glass.
+            IOHIDFloat ratio = _activePoints[newPointCount + index].pathMinorRatio;
+            if (ratio <= 0)
+                ratio = 0.82;
+            _activePoints[newPointCount + index].pathMajorRadius *= 0.82;
+            _activePoints[newPointCount + index].pathMinorRadius =
+                _activePoints[newPointCount + index].pathMajorRadius * ratio;
+        }
+        _activePoints[newPointCount + index].point = p;
     }
 
     IOHIDEventRef eventRef = [self _createIOHIDEventType:HandEventLifted];
@@ -749,6 +1022,128 @@ static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
     [self _updateTouchPoints:newLocations count:touchCount];
 }
 
+// Human reaching engine: minimum-jerk velocity profile along a curved
+// (cubic-bezier) path with per-sample motor noise, sampled at ~120 Hz with
+// jittered intervals. About 12% of aimed movements overshoot the target and
+// correct with a secondary submovement, mirroring human aiming error.
+- (void)_humanMoveToPoints:(CGPoint *)newLocations touchCount:(NSUInteger)touchCount duration:(NSTimeInterval)seconds {
+    NSParameterAssert(seconds > 0.0);
+
+    touchCount = MIN(touchCount, HIDMaxTouchCount);
+
+    // The stroke carries its own micro-noise; hold drift must not interleave.
+    _humanHoldDriftToken++;
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wvla-cxx-extension"
+    CGPoint startLocations[touchCount];
+    CGPoint mainEndLocations[touchCount];
+    CGPoint ctrl1Locations[touchCount];
+    CGPoint ctrl2Locations[touchCount];
+    CGPoint nextLocations[touchCount];
+    double distances[touchCount];
+#pragma clang diagnostic pop
+
+    for (NSUInteger i = 0; i < touchCount; ++i) {
+        startLocations[i] = _activePoints[i].point;
+        double dx = newLocations[i].x - startLocations[i].x;
+        double dy = newLocations[i].y - startLocations[i].y;
+        double d = MAX(hypot(dx, dy), 1.0);
+        distances[i] = d;
+    }
+
+    // Single-finger aimed movements sometimes overshoot and correct.
+    BOOL overshoot =
+        (touchCount == 1) && (distances[0] > 40.0) && (stUniformRandom(0.0, 1.0) < 0.12);
+    double overshootMag = 0.0;
+    if (overshoot)
+        overshootMag = stClamped(fabs(stGaussianRandom(0.0, 0.05 * distances[0])), 2.0, 0.15 * distances[0]);
+
+    // Path geometry is fixed per gesture (curvature + optional overshoot).
+    for (NSUInteger i = 0; i < touchCount; ++i) {
+        CGPoint s = startLocations[i];
+        CGPoint target = newLocations[i];
+        double dx = target.x - s.x;
+        double dy = target.y - s.y;
+        double d = distances[i];
+        double px = -dy / d, py = dx / d;
+
+        if (!overshoot) {
+            double amp1 = stClamped(stGaussianRandom(0.0, 0.05 * d), -0.20 * d, 0.20 * d);
+            double amp2 = stClamped(stGaussianRandom(0.0, 0.04 * d), -0.16 * d, 0.16 * d);
+            ctrl1Locations[i] = CGPointMake(s.x + dx * 0.33 + px * amp1, s.y + dy * 0.33 + py * amp1);
+            ctrl2Locations[i] = CGPointMake(s.x + dx * 0.66 + px * amp2, s.y + dy * 0.66 + py * amp2);
+            mainEndLocations[i] = target;
+        } else {
+            mainEndLocations[i] = CGPointMake(target.x + dx / d * overshootMag, target.y + dy / d * overshootMag);
+            double amp1 = stClamped(stGaussianRandom(0.0, 0.04 * d), -0.15 * d, 0.15 * d);
+            ctrl1Locations[i] =
+                CGPointMake(s.x + (mainEndLocations[i].x - s.x) * 0.5 + px * amp1,
+                            s.y + (mainEndLocations[i].y - s.y) * 0.5 + py * amp1);
+            ctrl2Locations[i] = ctrl1Locations[i];
+        }
+    }
+
+    CFAbsoluteTime startTime = CFAbsoluteTimeGetCurrent();
+    CFTimeInterval nextSampleAt = 0.0;
+    double lastEmitX = startLocations[0].x;
+    double lastEmitY = startLocations[0].y;
+
+    while (YES) {
+        CFTimeInterval elapsed = CFAbsoluteTimeGetCurrent() - startTime;
+        double t = stClamped(elapsed / seconds, 0.0, 1.0);
+
+        for (NSUInteger i = 0; i < touchCount; ++i) {
+            CGPoint s = startLocations[i];
+            CGPoint pos;
+
+            if (!overshoot) {
+                double te = stMinimumJerk(t);
+                double u = 1.0 - te;
+                CGPoint c1 = ctrl1Locations[i], c2 = ctrl2Locations[i], e = mainEndLocations[i];
+                pos.x = u * u * u * s.x + 3 * u * u * te * c1.x + 3 * u * te * te * c2.x + te * te * te * e.x;
+                pos.y = u * u * u * s.y + 3 * u * u * te * c1.y + 3 * u * te * te * c2.y + te * te * te * e.y;
+            } else if (t <= 0.8) {
+                double te = stMinimumJerk(t / 0.8);
+                double u = 1.0 - te;
+                CGPoint c1 = ctrl1Locations[i], e = mainEndLocations[i];
+                pos.x = u * u * s.x + 2 * u * te * c1.x + te * te * e.x;
+                pos.y = u * u * s.y + 2 * u * te * c1.y + te * te * e.y;
+            } else {
+                double te = stMinimumJerk((t - 0.8) / 0.2);
+                CGPoint m = mainEndLocations[i];
+                pos.x = m.x + (newLocations[i].x - m.x) * te;
+                pos.y = m.y + (newLocations[i].y - m.y) * te;
+            }
+
+            if (t < 1.0) {
+                pos.x += stGaussianRandom(0.0, stMoveNoiseSigma);
+                pos.y += stGaussianRandom(0.0, stMoveNoiseSigma);
+            }
+            nextLocations[i] = pos;
+        }
+
+        [self _updateTouchPoints:nextLocations count:touchCount];
+        [self _injectIMUMicroMotionWithActivity:hypot(nextLocations[0].x - lastEmitX, nextLocations[0].y - lastEmitY) /
+                                                25.0];
+        lastEmitX = nextLocations[0].x;
+        lastEmitY = nextLocations[0].y;
+
+        if (t >= 1.0)
+            break;
+
+        // ~120 Hz sampling with biological interval jitter.
+        nextSampleAt += stClamped(stGaussianRandom(0.0083, 0.0018), 0.004, 0.016);
+        CFTimeInterval wait = (startTime + nextSampleAt) - CFAbsoluteTimeGetCurrent();
+        if (wait > 0) {
+            struct timespec ts;
+            ts.tv_sec = (time_t)wait;
+            ts.tv_nsec = (long)((wait - floor(wait)) * nanosecondsPerSecond);
+            nanosleep(&ts, NULL);
+        }
+    }
+}
+
 - (void)_stylusDownAtPoint:(CGPoint)location
               azimuthAngle:(CGFloat)azimuthAngle
              altitudeAngle:(CGFloat)altitudeAngle
@@ -843,8 +1238,9 @@ static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
     NSParameterAssert(touchCount > 0);
     NSParameterAssert(delay > 0.0);
 
-    struct timespec doubleDelay = {0, (long)(multiTapInterval * nanosecondsPerSecond)};
-    struct timespec pressDelay = {0, (long)(fingerLiftDelay * nanosecondsPerSecond)};
+    BOOL humanize = stHumanizeEnabled();
+    struct timespec pressDelay = {0,
+                                  (long)((humanize ? stHumanKeyDwell() : fingerLiftDelay) * nanosecondsPerSecond)};
     BOOL useCustomDelay = delay > multiTapInterval;
 
     for (NSUInteger i = 0; i < tapCount; i++) {
@@ -855,8 +1251,11 @@ static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
             struct timespec customDelay = {0, (long)(delay * nanosecondsPerSecond)};
             nanosleep(&customDelay, 0);
         } else {
-            if (i + 1 != tapCount)
-                nanosleep(&doubleDelay, 0);
+            if (i + 1 != tapCount) {
+                NSTimeInterval gap = humanize ? stClamped(stGaussianRandom(0.16, 0.05), 0.08, 0.34) : multiTapInterval;
+                struct timespec gapDelay = {0, (long)(gap * nanosecondsPerSecond)};
+                nanosleep(&gapDelay, 0);
+            }
         }
     }
 }
@@ -903,18 +1302,39 @@ static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
 - (void)dragLinearWithStartPoint:(CGPoint)startLocation endPoint:(CGPoint)endLocation duration:(NSTimeInterval)seconds {
     NSParameterAssert(seconds > 0.0);
 
-    [self _touchDown:startLocation touchCount:1];
-    [self _moveLinearToPoints:&endLocation touchCount:1 duration:seconds];
-    [self _liftUp:endLocation touchCount:1];
+    if (stHumanizeEnabled()) {
+        // Approach dwell and release latency bracket the stroke; duration
+        // itself carries multiplicative noise so identical inputs never
+        // produce identical streams.
+        NSTimeInterval humanDuration = seconds * stUniformRandom(0.90, 1.12);
+        STAccurateSleep(stUniformRandom(0.03, 0.09));
+        [self _touchDown:startLocation touchCount:1];
+        [self _humanMoveToPoints:&endLocation touchCount:1 duration:humanDuration];
+        STAccurateSleep(stUniformRandom(0.04, 0.12));
+        [self _liftUp:endLocation touchCount:1];
+    } else {
+        [self _touchDown:startLocation touchCount:1];
+        [self _moveLinearToPoints:&endLocation touchCount:1 duration:seconds];
+        [self _liftUp:endLocation touchCount:1];
+    }
     [self sendMarkerHIDEvent];
 }
 
 - (void)dragCurveWithStartPoint:(CGPoint)startLocation endPoint:(CGPoint)endLocation duration:(NSTimeInterval)seconds {
     NSParameterAssert(seconds > 0.0);
 
-    [self _touchDown:startLocation touchCount:1];
-    [self _moveCurveToPoints:&endLocation touchCount:1 duration:seconds];
-    [self _liftUp:endLocation touchCount:1];
+    if (stHumanizeEnabled()) {
+        NSTimeInterval humanDuration = seconds * stUniformRandom(0.90, 1.12);
+        STAccurateSleep(stUniformRandom(0.03, 0.09));
+        [self _touchDown:startLocation touchCount:1];
+        [self _humanMoveToPoints:&endLocation touchCount:1 duration:humanDuration];
+        STAccurateSleep(stUniformRandom(0.04, 0.12));
+        [self _liftUp:endLocation touchCount:1];
+    } else {
+        [self _touchDown:startLocation touchCount:1];
+        [self _moveCurveToPoints:&endLocation touchCount:1 duration:seconds];
+        [self _liftUp:endLocation touchCount:1];
+    }
     [self sendMarkerHIDEvent];
 }
 
@@ -1197,7 +1617,8 @@ static inline uint32_t hidUsageCodeForCharacter(NSString *key) {
 }
 
 - (void)keyPress:(NSString *)character {
-    struct timespec pressDelay = {0, (long)(fingerLiftDelay * nanosecondsPerSecond)};
+    NSTimeInterval pressSec = stHumanizeEnabled() ? stHumanKeyDwell() : fingerLiftDelay;
+    struct timespec pressDelay = {0, (long)(pressSec * nanosecondsPerSecond)};
     bool shouldWrapWithShift = shouldWrapWithShiftKeyEventForCharacter(character);
     uint32_t usage = hidUsageCodeForCharacter(character);
 
@@ -1333,7 +1754,8 @@ static inline uint32_t hidUsageCodeForCharacter(NSString *key) {
 }
 
 - (void)menuPress {
-    struct timespec pressDelay = {0, (long)(fingerLiftDelay * nanosecondsPerSecond)};
+    NSTimeInterval pressSec = stHumanizeEnabled() ? stHumanKeyDwell() : fingerLiftDelay;
+    struct timespec pressDelay = {0, (long)(pressSec * nanosecondsPerSecond)};
 
     [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Menu isKeyDown:true];
     nanosleep(&pressDelay, 0);
@@ -1370,17 +1792,21 @@ static inline uint32_t hidUsageCodeForCharacter(NSString *key) {
 }
 
 - (void)menuDown {
+    _menuDownTime = CFAbsoluteTimeGetCurrent();
     [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Menu isKeyDown:true];
     [self sendMarkerHIDEvent];
 }
 
 - (void)menuUp {
+    [self _padHumanDwellSince:_menuDownTime];
+    _menuDownTime = 0;
     [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Menu isKeyDown:false];
     [self sendMarkerHIDEvent];
 }
 
 - (void)powerPress {
-    struct timespec pressDelay = {0, (long)(fingerLiftDelay * nanosecondsPerSecond)};
+    NSTimeInterval pressSec = stHumanizeEnabled() ? stHumanKeyDwell() : fingerLiftDelay;
+    struct timespec pressDelay = {0, (long)(pressSec * nanosecondsPerSecond)};
 
     [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Power isKeyDown:true];
     nanosleep(&pressDelay, 0);
@@ -1440,11 +1866,14 @@ static inline uint32_t hidUsageCodeForCharacter(NSString *key) {
 }
 
 - (void)powerDown {
+    _powerDownTime = CFAbsoluteTimeGetCurrent();
     [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Power isKeyDown:true];
     [self sendMarkerHIDEvent];
 }
 
 - (void)powerUp {
+    [self _padHumanDwellSince:_powerDownTime];
+    _powerDownTime = 0;
     [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Power isKeyDown:false];
     [self sendMarkerHIDEvent];
 }

@@ -4576,6 +4576,8 @@ static void setupRfbScreen(int argc, const char *argv[]) {
     TVBindHostKind hostKind = tvClassifyBindHost(gBindHost, &v4Addr, &v6Addr);
     if (hostKind == kTVBindHostKindIPv4) {
         gScreen->listenInterface = v4Addr;
+        // An explicit IPv4 bind must not leave an unrelated IPv6 wildcard listener.
+        gScreen->ipv6port = -1;
     } else if (hostKind == kTVBindHostKindIPv6) {
         char ifaceBuf[INET6_ADDRSTRLEN];
         const char *iface = inet_ntop(AF_INET6, &v6Addr, ifaceBuf, sizeof(ifaceBuf));
